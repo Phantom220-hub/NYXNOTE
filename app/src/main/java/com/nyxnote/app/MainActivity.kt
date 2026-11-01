@@ -32,7 +32,7 @@ private val TXT=Color(0xFFF2F6FF); private val MUTED=Color(0xFF91A2BC)
 
 data class Entry(val id:Long,val title:String,val body:String="",val done:Boolean=false,val progress:Int=0)
 
-class NyxDb(c:Context):SQLiteOpenHelper(c,"nyxnote.db",null,1){
+class NyxDb(c:Context):SQLiteOpenHelper(c,"nyxnote.db",null,2){
  override fun onCreate(d:SQLiteDatabase){
   d.execSQL("CREATE TABLE tasks(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,done INTEGER DEFAULT 0,priority TEXT DEFAULT 'Обычный',created INTEGER)")
   d.execSQL("CREATE TABLE goals(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,progress INTEGER DEFAULT 0)")
@@ -42,8 +42,15 @@ class NyxDb(c:Context):SQLiteOpenHelper(c,"nyxnote.db",null,1){
   d.execSQL("CREATE TABLE ideas(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,body TEXT DEFAULT '',created INTEGER)")
   d.execSQL("CREATE TABLE learning(id INTEGER PRIMARY KEY AUTOINCREMENT,title TEXT NOT NULL,progress INTEGER DEFAULT 0)")
   d.execSQL("CREATE TABLE focus(id INTEGER PRIMARY KEY AUTOINCREMENT,seconds INTEGER,created INTEGER)")
+  d.execSQL("CREATE TABLE xp(id INTEGER PRIMARY KEY CHECK(id=1), total INTEGER NOT NULL DEFAULT 0)")
+  d.execSQL("INSERT INTO xp(id,total) VALUES(1,0)")
  }
- override fun onUpgrade(d:SQLiteDatabase,o:Int,n:Int){}
+ override fun onUpgrade(d:SQLiteDatabase,o:Int,n:Int){
+  if(o<2){
+   d.execSQL("CREATE TABLE IF NOT EXISTS xp(id INTEGER PRIMARY KEY CHECK(id=1), total INTEGER NOT NULL DEFAULT 0)")
+   d.execSQL("INSERT OR IGNORE INTO xp(id,total) VALUES(1,0)")
+  }
+ }
  fun add(t:String,title:String,body:String=""){
   val v=ContentValues()
   when(t){
@@ -65,8 +72,23 @@ class NyxDb(c:Context):SQLiteOpenHelper(c,"nyxnote.db",null,1){
    a.add(Entry(id,title,body,done,progress))
   }};return a
  }
- fun taskDone(id:Long,v:Boolean){writableDatabase.execSQL("UPDATE tasks SET done=? WHERE id=?",arrayOf(if(v)1 else 0,id))}
- fun progress(t:String,id:Long,v:Int){writableDatabase.execSQL("UPDATE $t SET progress=? WHERE id=?",arrayOf(v.coerceIn(0,100),id))}
+ fun totalXp():Int{val c=readableDatabase.rawQuery("SELECT total FROM xp WHERE id=1",null);c.use{return if(it.moveToFirst())it.getInt(0) else 0}}
+ fun addXp(points:Int){if(points>0)writableDatabase.execSQL("UPDATE xp SET total=total+? WHERE id=1",arrayOf(points))}
+ fun level():Int=totalXp()/100+1
+ fun levelProgress():Int=totalXp()%100
+ fun taskDone(id:Long,v:Boolean){
+  val c=readableDatabase.rawQuery("SELECT done FROM tasks WHERE id=?",arrayOf(id.toString()))
+  val wasDone=c.use{it.moveToFirst() && it.getInt(0)==1}
+  writableDatabase.execSQL("UPDATE tasks SET done=? WHERE id=?",arrayOf(if(v)1 else 0,id))
+  if(v && !wasDone)addXp(10)
+ }
+ fun progress(t:String,id:Long,v:Int){
+  val c=readableDatabase.rawQuery("SELECT progress FROM $t WHERE id=?",arrayOf(id.toString()))
+  val old=c.use{if(it.moveToFirst())it.getInt(0) else 0}
+  val next=v.coerceIn(0,100)
+  writableDatabase.execSQL("UPDATE $t SET progress=? WHERE id=?",arrayOf(next,id))
+  if(t=="goals" && old<100 && next==100)addXp(50)
+ }
  fun delete(t:String,id:Long){writableDatabase.delete(t,"id=?",arrayOf(id.toString()))}
  fun focus(seconds:Int){val v=ContentValues().apply{put("seconds",seconds);put("created",System.currentTimeMillis())};writableDatabase.insert("focus",null,v)}
  fun count(sql:String):Int{val c=readableDatabase.rawQuery(sql,null);c.use{return if(it.moveToFirst())it.getInt(0) else 0}}
@@ -104,6 +126,7 @@ class MainActivity:ComponentActivity(){
    "Сегодня"->{
     val tasks=db.list("tasks");val done=tasks.count{it.done}
     Text(SimpleDateFormat("EEEE, d MMMM",Locale("ru")).format(Date()).replaceFirstChar{it.uppercase()},color=MUTED)
+    CardBox{Row(verticalAlignment=Alignment.CenterVertically){Column(Modifier.weight(1f)){Text("УРОВЕНЬ ${db.level()}",color=c,fontSize=11.sp,fontWeight=FontWeight.Bold);Text("${db.totalXp()} XP",color=TXT,fontSize=27.sp,fontWeight=FontWeight.Bold)};Text("+10 XP за задачу",color=MUTED,fontSize=10.sp)};LinearProgressIndicator(progress={db.levelProgress()/100f},modifier=Modifier.fillMaxWidth(),color=c,trackColor=PANEL2);Text("${db.levelProgress()} / 100 XP до следующего уровня",color=MUTED,fontSize=11.sp)}
     CardBox{Text("ПРОГРЕСС ДНЯ",color=c,fontSize=10.sp,fontWeight=FontWeight.Bold);Text("$done / ${tasks.size}",color=TXT,fontSize=30.sp,fontWeight=FontWeight.Bold);LinearProgressIndicator(progress={if(tasks.isEmpty())0f else done.toFloat()/tasks.size},modifier=Modifier.fillMaxWidth(),color=c,trackColor=PANEL2)}
     AddLine("Новая задача…",c){db.add("tasks",it);refresh++}
     tasks.forEach{e->Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(13.dp)).background(PANEL).padding(8.dp),verticalAlignment=Alignment.CenterVertically){Checkbox(e.done,{db.taskDone(e.id,it);refresh++},colors=CheckboxDefaults.colors(checkedColor=c));Text(e.title,color=if(e.done)MUTED else TXT,modifier=Modifier.weight(1f));IconButton(onClick={db.delete("tasks",e.id);refresh++}){Icon(Icons.Default.Delete,null,tint=MUTED)}}}
@@ -111,7 +134,7 @@ class MainActivity:ComponentActivity(){
    "Цели"->{AddLine("Например: выучить C++",c){db.add("goals",it);refresh++};db.list("goals").forEach{e->CardBox{Row{Text(e.title,color=TXT,modifier=Modifier.weight(1f));Text("${e.progress}%",color=c)};LinearProgressIndicator(progress={e.progress/100f},modifier=Modifier.fillMaxWidth(),color=c);Row{TextButton(onClick={db.progress("goals",e.id,e.progress+10);refresh++}){Text("+10%",color=c)};TextButton(onClick={db.delete("goals",e.id);refresh++}){Text("Удалить",color=MUTED)}}}}}
    "Заметки"->{var q by remember{mutableStateOf("")};AddLine("Заголовок заметки…",c){db.add("notes",it);refresh++};Field(q,{q=it},"Поиск по заметкам…");db.list("notes").filter{it.title.contains(q,true)||it.body.contains(q,true)}.forEach{e->CardBox{Text(e.title,color=TXT,fontWeight=FontWeight.Bold);Text(e.body.ifBlank{"Открой заметку, чтобы дополнить её (редактор будет расширен)."},color=MUTED);TextButton(onClick={db.delete("notes",e.id);refresh++}){Text("Удалить",color=MUTED)}}}}
    "Фокус"->FocusPanel(c,db)
-   "Статистика"->{val tasks=db.count("SELECT COUNT(*) FROM tasks WHERE done=1");val goals=db.count("SELECT COUNT(*) FROM goals WHERE progress=100");val sec=db.count("SELECT COALESCE(SUM(seconds),0) FROM focus");Row(horizontalArrangement=Arrangement.spacedBy(10.dp)){Stat("Задачи",tasks.toString(),c,Modifier.weight(1f));Stat("Цели",goals.toString(),PURPLE,Modifier.weight(1f))};Stat("Фокус","${sec/3600} ч ${(sec%3600)/60} мин",GREEN,Modifier.fillMaxWidth());CardBox{Text("Твой принцип",color=c);Text("Регулярность важнее идеального дня. Каждый маленький шаг считается.",color=TXT)}}
+   "Статистика"->{val tasks=db.count("SELECT COUNT(*) FROM tasks WHERE done=1");val goals=db.count("SELECT COUNT(*) FROM goals WHERE progress=100");val sec=db.count("SELECT COALESCE(SUM(seconds),0) FROM focus");Row(horizontalArrangement=Arrangement.spacedBy(10.dp)){Stat("Задачи",tasks.toString(),c,Modifier.weight(1f));Stat("Цели",goals.toString(),PURPLE,Modifier.weight(1f))};Stat("Фокус","${sec/3600} ч ${(sec%3600)/60} мин",GREEN,Modifier.fillMaxWidth());CardBox{Text("УРОВЕНЬ ${db.level()}",color=c,fontWeight=FontWeight.Bold);Text("${db.totalXp()} XP всего",color=TXT,fontSize=25.sp,fontWeight=FontWeight.Bold);LinearProgressIndicator(progress={db.levelProgress()/100f},modifier=Modifier.fillMaxWidth(),color=c);Text("${db.levelProgress()} / 100 XP до следующего уровня",color=MUTED,fontSize=11.sp)};CardBox{Text("Твой принцип",color=c);Text("Регулярность важнее идеального дня. Каждый маленький шаг считается.",color=TXT)}}
    "Обучение"->{AddLine("Навык для изучения…",c){db.add("learning",it);refresh++};db.list("learning").forEach{ProgressItem(it,"learning",db,c){refresh++}}}
    "Привычки"->{AddLine("Новая привычка…",c){db.add("habits",it);refresh++};db.list("habits").forEach{CardBox{Text(it.title,color=TXT,fontWeight=FontWeight.Bold);Text(it.body,color=MUTED);Text("Отмечай выполнение каждый день. Серии будут расширены в следующем обновлении.",color=MUTED,fontSize=11.sp);TextButton(onClick={db.delete("habits",it.id);refresh++}){Text("Удалить",color=MUTED)}}}}
    "Дневник"->{var v by remember{mutableStateOf("")};CardBox{Field(v,{v=it},"Что произошло сегодня?");Button(onClick={if(v.isNotBlank()){db.add("journal",v);v="";refresh++}},colors=ButtonDefaults.buttonColors(containerColor=c)){Text("Сохранить запись",color=BG)}};db.list("journal").forEach{CardBox{Text(it.body,color=TXT);TextButton(onClick={db.delete("journal",it.id);refresh++}){Text("Удалить",color=MUTED)}}}}
@@ -131,6 +154,6 @@ class MainActivity:ComponentActivity(){
 @Composable fun ProgressItem(e:Entry,t:String,db:NyxDb,c:Color,refresh:()->Unit){CardBox{Row{Text(e.title,color=TXT,modifier=Modifier.weight(1f));Text("${e.progress}%",color=c)};LinearProgressIndicator(progress={e.progress/100f},modifier=Modifier.fillMaxWidth(),color=c);TextButton(onClick={db.progress(t,e.id,e.progress+10);refresh()}){Text("+10%",color=c)}}}
 @Composable fun FocusPanel(c:Color,db:NyxDb){
  var left by remember{mutableIntStateOf(1500)};var elapsed by remember{mutableIntStateOf(0)};var running by remember{mutableStateOf(false)}
- LaunchedEffect(running){while(running){delay(1000);if(left>0){left--;elapsed++}else{running=false;db.focus(elapsed);elapsed=0}}}
+ LaunchedEffect(running){while(running){delay(1000);if(left>0){left--;elapsed++}else{running=false;db.focus(elapsed);db.addXp(25);elapsed=0}}}
  CardBox{Text("POMODORO  •  25 / 5",color=c,fontSize=11.sp,fontWeight=FontWeight.Bold);Text(String.format(Locale.US,"%02d:%02d",left/60,left%60),color=TXT,fontSize=52.sp,fontWeight=FontWeight.Light);Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){Button(onClick={running=!running},colors=ButtonDefaults.buttonColors(containerColor=c)){Text(if(running)"Пауза" else "Старт",color=BG)};OutlinedButton(onClick={running=false;left=1500;db.focus(elapsed);elapsed=0}){Text("Сброс",color=TXT)};OutlinedButton(onClick={running=false;left=300;elapsed=0}){Text("Перерыв",color=TXT)}};Text("Завершённые сессии учитываются в статистике.",color=MUTED,fontSize=11.sp)}
 }
